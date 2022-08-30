@@ -1795,13 +1795,6 @@ if __name__ == "__main__":
     PyPI_URL = "https://pypi.org/project/soos-sca"
     SOOS.console_log(f"\n\nThis CLI has been packaged and uploaded to PyPI! You can find it here: {PyPI_URL} \n")
     SOOS.console_log("Checking latest version...")
-    latest_version, github_url = GithubVersionChecker.get_latest_version()
     current_version = f"v{SCRIPT_VERSION}"
-
-    if latest_version is not None and latest_version != current_version:
-        SOOS.console_log(
-            f"Your current version {current_version} is out of date! Please update to the latest version {latest_version} on GitHub ({github_url}) or use the package on PyPI ({PyPI_URL}).")
-    else:
-        SOOS.console_log(f"Your current version {current_version} is the latest version available.")
 
     entry_point()
