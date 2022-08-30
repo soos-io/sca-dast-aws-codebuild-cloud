@@ -9,16 +9,20 @@ import platform
 import sys
 import time
 import requests
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path, WindowsPath, PurePath, PureWindowsPath  # User Home Folder references
 from typing import List, AnyStr, Optional, Any, Dict, Union, Tuple
 
 
-SCRIPT_VERSION = "1.5.5"
 SCAN_TYPE = "sca"
 ANALYSIS_START_TIME = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 MAX_MANIFESTS = 50
+SCAN_STATUS_ERROR = "Error"
+SCAN_STATUS_INCOMPLETE = "Incomplete"
 
+with open(os.path.join(os.path.dirname(__file__), "VERSION.txt")) as version_file:
+  SCRIPT_VERSION = version_file.read().strip()
 
 class GithubVersionChecker:
     GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/soos-io/soos-ci-analysis-python/releases/latest"
@@ -219,6 +223,12 @@ class SOOSStructureAPI:
         if soos_context.integration_name is not None:
             structure_api_data["integrationName"] = soos_context.integration_name
 
+        if soos_context.integration_type is not None:
+            structure_api_data["integrationType"] = soos_context.integration_type
+
+        if soos_context.app_version is not None:
+            structure_api_data["appVersion"] = soos_context.app_version
+
         for i in range(0, SOOSStructureAPI.API_RETRY_COUNT):
             try:
                 kernel = requests.post(
@@ -263,12 +273,11 @@ class SOOSContext:
         self.build_version = None
         self.build_uri = None
         self.operating_environment = None
+        self.app_version = None
         self.integration_name = None
+        self.integration_type = "Script"
         self.generate_sarif_report = False
         self.github_pat = None
-
-        # INTENTIONALLY HARDCODED
-        self.integration_type = "Script"
 
     def __set_source_code_path__(self, source_code_directory):
         """
@@ -392,8 +401,8 @@ class SOOSContext:
             self.api_key = str(script_args.api_key)
             SOOS.console_log("SOOS_API_KEY Parameter Loaded: SECRET")
 
-        if script_args.verbose_logging is True:
-            self.verbose_logging = script_args.verbose_logging
+        if script_args.logging_verbose is True or str(script_args.logging_verbosity).upper() == "DEBUG":
+            self.verbose_logging = True
             SOOS.console_log("SOOS_VERBOSE_LOGGING: Enabled")
 
         # ##################################################
@@ -433,10 +442,17 @@ class SOOSContext:
             self.operating_environment = '{system} {release} {architecture}'.format(system=platform.system(), release=platform.release(), architecture=platform.architecture()[0])
         SOOS.console_log("SOOS_OPERATING_ENVIRONMENT Parameter Loaded: " + self.operating_environment)
 
-        if script_args.integration_name is not None:
-            if len(script_args.integration_name) > 0:
-                self.integration_name = str(script_args.integration_name)
-                SOOS.console_log("SOOS_INTEGRATION_NAME Parameter Loaded: " + self.integration_name)
+        if script_args.app_version is not None and len(script_args.app_version) > 0:
+            self.app_version = str(script_args.app_version)
+            SOOS.console_log("SOOS_APP_VERSION Parameter Loaded: " + self.app_version)
+
+        if script_args.integration_name is not None and len(script_args.integration_name) > 0:
+            self.integration_name = str(script_args.integration_name)
+            SOOS.console_log("SOOS_INTEGRATION_NAME Parameter Loaded: " + self.integration_name)
+
+        if script_args.integration_type is not None and len(script_args.integration_type) > 0:
+            self.integration_type = str(script_args.integration_type)
+            SOOS.console_log("SOOS_INTEGRATION_TYPE Parameter Loaded: " + self.integration_type)
 
         if script_args.generate_sarif_report is True:
             self.generate_sarif_report = script_args.generate_sarif_report
@@ -479,12 +495,12 @@ class SOOSContext:
         if self.client_id is None or len(self.client_id) == 0:
             SOOS.console_log("REQUIRED PARAMETER IS MISSING: SOOS_CLIENT_ID")
             SOOS.console_log(
-                "CLIENT_ID, if you do not already have one, will be provided with a subscription to SOOS.io services.")
+                "CLIENT_ID, found at https://app.soos.io/integrate/sca")
 
         if self.api_key is None or len(self.api_key) == 0:
             SOOS.console_log("REQUIRED PARAMETER IS MISSING: SOOS_API_KEY")
             SOOS.console_log(
-                "API_KEY, if you do not already have one, will be provided with a subscription to SOOS.io services.")
+                "API_KEY, found at https://app.soos.io/integrate/sca")
 
 
 class SOOSScanAPI:
@@ -520,9 +536,8 @@ class SOOSScanAPI:
         return url
 
     @staticmethod
-    def create_scan_metadata(context: SOOSContext, **kwargs) -> Union[CreateScanAPIResponse, ErrorAPIResponse]:
+    def create_scan_metadata(context: SOOSContext) -> Union[CreateScanAPIResponse, ErrorAPIResponse]:
         create_scan_response = None
-        toolName = kwargs.get('tool_name')
 
         try:
             url = SOOSScanAPI.generate_scan_api_url(context=context, url_type="create")
@@ -534,7 +549,6 @@ class SOOSScanAPI:
                 "scriptVersion": SCRIPT_VERSION,
             }
 
-            set_body_value(start_scan_data, 'toolName', toolName)
             set_body_value(start_scan_data, 'commitHash', context.commit_hash)
             set_body_value(start_scan_data, 'branch', context.branch_name)
             set_body_value(start_scan_data, 'branchUri', context.branch_uri)
@@ -542,6 +556,7 @@ class SOOSScanAPI:
             set_body_value(start_scan_data, 'buildUri', context.build_uri)
             set_body_value(start_scan_data, 'operatingEnvironment', context.operating_environment)
             set_body_value(start_scan_data, 'integrationName', context.integration_name)
+            set_body_value(start_scan_data, 'appVersion', context.app_version)
 
             headers = generate_header(api_key=context.api_key, content_type="application/json")
             data = json.dumps(start_scan_data)
@@ -552,7 +567,7 @@ class SOOSScanAPI:
                 json_response = handle_response(api_response)
                 if type(json_response) is ErrorAPIResponse:
                     create_scan_response = json_response
-                    error_message = f"A Create Structure API Exception Occurred. Attempt {str(attempt + 1)} of {str(SOOSScanAPI.API_RETRY_COUNT)}"
+                    error_message = f"A Create Scan MetaData API Exception Occurred. Attempt {str(attempt + 1)} of {str(SOOSScanAPI.API_RETRY_COUNT)}"
                     SOOS.console_log(f"{error_message}\n{json_response.code}-{json_response.message}")
                 else:
                     create_scan_response = CreateScanAPIResponse(create_scan_json_response=json_response)
@@ -726,7 +741,7 @@ class SOOS:
         )
 
     # returns count of valid manifests that were uploaded or None on error
-    def send_manifests(self, project_id, analysis_id, dirs_to_exclude, files_to_exclude) -> Optional[int]:
+    def send_manifests(self, project_id, analysis_id, dirs_to_exclude, files_to_exclude, package_managers) -> Optional[int]:
 
         has_more_than_maximum_manifests = False
 
@@ -741,8 +756,10 @@ class SOOS:
         manifestArr = []
 
         for manifest_file in MANIFEST_FILES:
-            files = []
             package_manager = manifest_file['packageManager']
+            if len(package_managers) > 0 and package_manager.lower() not in (manager.lower() for manager in package_managers):
+                continue
+            files = []
             SOOS.console_log("Looking for " + package_manager + " files...")
 
             for entries in manifest_file["manifests"]:
@@ -762,7 +779,7 @@ class SOOS:
 
                 for exclude_dir in dirs_to_exclude:
                     # Directories to Exclude
-                    if fnmatch.fnmatch(pure_directory, exclude_dir) or exclude_dir in pure_directory:
+                    if os.path.normpath(exclude_dir) in pure_directory.replace(soos.context.source_code_path, ""):
                         # skip this manifest
                         soos.console_log_verbose("Skipping file due to dirs_to_exclude: " + file_name)
                         exclude = True
@@ -804,9 +821,11 @@ class SOOS:
                             # attempt to get immediate parent folder
                             if full_file_path.find("/") >= 0:
                                 # get furthest-right folder (immediate parent)
-                                immediate_parent_folder = pure_directory.split("/")[-1]
+                                foldersSplitted = pure_directory.replace(soos.context.source_code_path, "").split("/")
+                                parent_folder = "/".join(foldersSplitted)
                             else:
-                                immediate_parent_folder = pure_directory.split("\\")[-1]
+                                foldersSplitted = pure_directory.replace(soos.context.source_code_path, "").split("\\")
+                                parent_folder = "/".join(foldersSplitted)
 
                         except Exception as e:
 
@@ -815,7 +834,7 @@ class SOOS:
                                              )
                             pass
 
-                        manifest_label = immediate_parent_folder
+                        manifest_label = parent_folder
 
                         with open(file_name, mode='r', encoding="utf-8") as the_file:
                             content = the_file.read()
@@ -1055,6 +1074,54 @@ class SOOSAnalysisResultAPI:
 
         return analysis_result_response
 
+class SOOSPatchStatusAPI:
+    API_RETRY_COUNT = 3
+
+    URI_TEMPLATE = "{soos_base_uri}clients/{soos_client_id}/projects/{project_hash}/branches/{branch_hash}/scan-types/{scan_type}/scans/{scan_id}"
+
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def generate_api_url(soos_context, create_scan_api_response):
+        url = SOOSPatchStatusAPI.URI_TEMPLATE
+        url = url.replace("{soos_base_uri}", soos_context.base_uri)
+        url = url.replace("{soos_client_id}", soos_context.client_id)
+        url = url.replace("{project_hash}", create_scan_api_response.projectHash)
+        url = url.replace("{branch_hash}", create_scan_api_response.branchHash)
+        url = url.replace("{scan_type}", SCAN_TYPE)
+        url = url.replace("{scan_id}", create_scan_api_response.analysisId)
+        return url
+
+    @staticmethod
+    def exec(soos_context, create_scan_api_response, status, message):
+
+        api_url = SOOSPatchStatusAPI.generate_api_url(soos_context, create_scan_api_response)
+
+        patch_status_data = {
+            "Status": status,
+            "Message": message
+        }
+
+        for i in range(0, SOOSPatchStatusAPI.API_RETRY_COUNT):
+            try:
+                response = requests.patch(
+                    url=api_url,
+                    data=json.dumps(patch_status_data),
+                    headers={'x-soos-apikey': soos_context.api_key, 'Content-Type': 'application/json'})
+
+                json_response = handle_response(api_response=response)
+
+                if type(json_response) is ErrorAPIResponse:
+                    raise Exception(f"{json_response.code}-{json_response.message}")
+
+                break
+
+            except Exception as e:
+                SOOS.console_log("Error updating scan status. "
+                                 "Attempt " + str(i + 1) + " of " + str(SOOSPatchStatusAPI.API_RETRY_COUNT) + "::" +
+                                 "Exception: " + str(e)
+                                 )
 
 class SOOSSARIFReport:
     API_RETRY_COUNT = 3
@@ -1193,6 +1260,7 @@ class SOOSAnalysisScript:
 
         self.directories_to_exclude = None
         self.files_to_exclude = None
+        self.package_managers = None
 
         self.working_directory = None
 
@@ -1251,7 +1319,7 @@ class SOOSAnalysisScript:
 
         SOOS.console_log("ON_FAILURE: " + self.on_failure)
 
-        self.directories_to_exclude = ["node_modules", "soos\\workspace"]
+        self.directories_to_exclude = ["node_modules", "soos"]
 
         if script_args.directories_to_exclude is not None and len(script_args.directories_to_exclude.strip()) > 0:
             SOOS.console_log(f"DIRS_TO_EXCLUDE: {script_args.directories_to_exclude.strip()}")
@@ -1271,6 +1339,16 @@ class SOOSAnalysisScript:
                 self.files_to_exclude.append(a_file.strip())
         else:
             SOOS.console_log("FILES_TO_EXCLUDE: <NONE>")
+
+        self.package_managers = []
+        if script_args.package_managers is not None and len(script_args.package_managers.strip()) > 0:
+            SOOS.console_log(f"PACKAGE MANAGERS: {script_args.package_managers.strip()}")
+            temp_package_managers: List[str] = script_args.package_managers.split(",")
+
+            for package_managers in temp_package_managers:
+                self.package_managers.append(package_managers.strip())
+        else:
+            SOOS.console_log("PACKAGE MANAGERS: <NONE>")    
 
         # WORKING DIRECTORY & ASYNC RESUlT FILE
         self.__set_working_dir_and_async_result_file__(script_args.working_directory)
@@ -1305,28 +1383,37 @@ class SOOSAnalysisScript:
 
         parser = argparse.ArgumentParser(description="SOOS CI Integration Script")
 
+        # DOCUMENTATION
+
+        parser.add_argument('-hf', "--helpFormatted", dest="help_formatted",
+                            help="Print the --help command in markdown table format",
+                            action="store_true",
+                            default=False,
+                            required=False)
+
         # SCRIPT PARAMETERS
 
-        parser.add_argument("-m", dest="mode",
-                            help="Mode of operation: "
-                                 "run_and_wait: Run Analysis & Wait ** Default Value, "
-                                 "async_init: Async Init, "
-                                 "async_result: Async Result",
+        parser.add_argument("-m", "--mode", dest="mode",
+                            help="Mode of operation:\n"
+                                 "run_and_wait: Run Analysis & Wait ** Default Value,\n"
+                                 "async_init: Async Init,\n"
+                                 "async_result: Async Result\n"
+                                 "For more information about scan modes, visit https://github.com/soos-io/kb-docs/blob/main/SCA/Script.md",
                             type=str,
                             default="run_and_wait",
                             required=False
                             )
 
-        parser.add_argument("-of", dest="on_failure",
-                            help="On Failure: "
-                                 "fail_the_build: Fail The Build ** Default Value, "
-                                 "continue_on_failure: Continue On Failure",
+        parser.add_argument("-of", "--onFailure", dest="on_failure",
+                            help="On Failure:\n"
+                                 "fail_the_build: Fail The Build\n"
+                                 "continue_on_failure: Continue On Failure ** Default Value",
                             type=str,
                             default="continue_on_failure",
                             required=False
                             )
 
-        parser.add_argument("-dte", dest="directories_to_exclude",
+        parser.add_argument("-dte", "--directoriesToExclude", dest="directories_to_exclude",
                             help="Listing of directories (relative to ./) to exclude from the search for manifest files.\n"
                                  "Example - Correct: bin/start/\n"
                                  "Example - Incorrect: ./bin/start/\n"
@@ -1335,7 +1422,7 @@ class SOOSAnalysisScript:
                             required=False
                             )
 
-        parser.add_argument("-fte", dest="files_to_exclude",
+        parser.add_argument("-fte", "--filesToExclude", dest="files_to_exclude",
                             help="Listing of files (relative to ./) to exclude from the search for manifest files.\n"
                                  "Example - Correct: bin/start/requirements.txt\n"
                                  "Example - Incorrect: ./bin/start/requirements.txt\n"
@@ -1344,7 +1431,7 @@ class SOOSAnalysisScript:
                             required=False
                             )
 
-        parser.add_argument("-wd", dest="working_directory",
+        parser.add_argument("-wd", "--workingDirectory", dest="working_directory",
                             help="Absolute path where SOOS may write and read persistent files for the given build.\n"
                                  "Example - Correct: /tmp/workspace/\n"
                                  "Example - Incorrect: ./bin/start/\n"
@@ -1353,107 +1440,134 @@ class SOOSAnalysisScript:
                             required=False
                             )
 
-        parser.add_argument("-armw", dest="analysis_result_max_wait",
+        parser.add_argument("-armw", "--resultMaxWait", dest="analysis_result_max_wait",
                             help="Maximum seconds to wait for Analysis Result. Default 300.",
                             type=int,
                             default=300,
                             required=False
                             )
 
-        parser.add_argument("-arpi", dest="analysis_result_polling_interval",
-                            help="Polling interval (in seconds) for analysis result completion (success/failure). "
+        parser.add_argument("-arpi", "--resultPollingInterval", dest="analysis_result_polling_interval",
+                            help="Polling interval (in seconds) for analysis result completion (success/failure).\n"
                                  "Min value: 10",
                             type=int,
                             default=10,
                             required=False
                             )
 
+        parser.add_argument("-pm", "--packageManagers", dest="package_managers",
+                            help="A list of package managers, delimited by comma, to include when searching for manifest files.",
+                            type=str,
+                            required=False
+                            )              
+
         # CONTEXT PARAMETERS
 
-        parser.add_argument("-buri", dest="base_uri",
-                            help="API URI Path. Default Value: https://api.soos.io/api/",
+        parser.add_argument("-buri", "--baseUri", dest="base_uri",
+                            help="SOOS API URI Path. Default Value: https://api.soos.io/api/\n"
+                                 "Intended for internal use only.",
                             type=str,
                             default="https://api.soos.io/api/",
                             required=False
                             )
 
-        parser.add_argument("-scp", dest="source_code_path",
+        parser.add_argument("-scp", "--sourceCodePath", dest="source_code_path",
                             help="Root path to begin recursive search for manifests. Default Value: ./",
                             type=str,
                             required=False
                             )
 
-        parser.add_argument("-pn", dest="project_name",
-                            help="Project name for tracking results",
+        parser.add_argument("-pn", "--projectName", dest="project_name",
+                            help="Project name for tracking results, (this will be the one used inside of the SOOS App)",
                             type=str,
                             required=False
                             )
 
-        parser.add_argument("-cid", dest="client_id",
-                            help="API Client ID",
+        parser.add_argument("-cid", "--clientId", dest="client_id",
+                            help="Client ID, get yours from https://app.soos.io/integrate/sca",
                             type=str,
                             required=False
                             )
 
-        parser.add_argument("-akey", dest="api_key",
-                            help="API Key",
+        parser.add_argument("-akey", "--apiKey", dest="api_key",
+                            help="API Key, get yours from https://app.soos.io/integrate/sca",
                             type=str,
                             required=False
                             )
 
-        parser.add_argument("-v", dest="verbose_logging",
+        parser.add_argument("-v", "--verbosity", dest="logging_verbosity",
+                            help="Set logging verbosity level value (INFO/DEBUG)",
+                            type=str,
+                            default="INFO",
+                            required=False
+                            )
+
+        parser.add_argument("--verbose", dest="logging_verbose",
                             help="Enable verbose logging",
-                            type=bool,
-                            default=False,
+                            action="store_true",
                             required=False
                             )
 
         # CI SPECIAL CONTEXT
 
-        parser.add_argument("-ch", dest="commit_hash",
+        parser.add_argument("-ch", "--commitHash", dest="commit_hash",
                             help="Commit Hash Value",
                             type=str,
                             default=None,
                             required=False
                             )
 
-        parser.add_argument("-bn", dest="branch_name",
+        parser.add_argument("-bn", "--branchName", dest="branch_name",
                             help="Branch Name",
                             type=str,
                             default=None,
                             required=False
                             )
 
-        parser.add_argument("-bruri", dest="branch_uri",
+        parser.add_argument("-bruri", "--branchUri", dest="branch_uri",
                             help="Branch URI",
                             type=str,
                             default=None,
                             required=False
                             )
 
-        parser.add_argument("-bldver", dest="build_version",
+        parser.add_argument("-bldver", "--buildVersion", dest="build_version",
                             help="Build Version",
                             type=str,
                             default=None,
                             required=False
                             )
 
-        parser.add_argument("-blduri", dest="build_uri",
+        parser.add_argument("-blduri", "--buildUri", dest="build_uri",
                             help="Build URI",
                             type=str,
                             default=None,
                             required=False
                             )
 
-        parser.add_argument("-oe", dest="operating_environment",
+        parser.add_argument("-oe", "--operatingEnvironment", dest="operating_environment",
                             help="Operating Environment",
                             type=str,
                             default=None,
                             required=False
                             )
 
-        parser.add_argument("-intn", dest="integration_name",
+        parser.add_argument("-appver", "--appVersion", dest="app_version",
+                            help="App Version. Intended for internal use only.",
+                            type=str,
+                            default=None,
+                            required=False
+                            )
+
+        parser.add_argument("-intn", "--integrationName", dest="integration_name",
                             help="Integration Name (e.g. Provider)",
+                            type=str,
+                            default=None,
+                            required=False
+                            )
+
+        parser.add_argument("-intt", "--integrationType", dest="integration_type",
+                            help="Integration Type. Intended for internal use only.",
                             type=str,
                             default=None,
                             required=False
@@ -1475,35 +1589,22 @@ class SOOSAnalysisScript:
 
         return parser
 
+# Initialize SOOS
+soos = SOOS()
 
-if __name__ == "__main__":
-
-    # if ((3, 0) <= sys.version_info <= (3, 9)):
-    if sys.version_info < (3, 6):
-        print("**** SOOS FATAL ERROR: Python Version 3.6 or higher is required ****")
-        sys.exit(1)
-
-    SOOS.console_log("Checking Script Version.....")
-    latest_version, github_url = GithubVersionChecker.get_latest_version()
-    current_version = f"v{SCRIPT_VERSION}"
-
-    if latest_version is not None and latest_version != current_version:
-        SOOS.console_log(
-            f"Your current version {current_version} is outdated. The latest version available is {latest_version}. Please update to the latest version here: {github_url}")
-    else:
-        SOOS.console_log(f"Your current version {current_version} is the latest version available")
-
-    # Initialize SOOS
-    soos = SOOS()
+def entry_point():
     more_info = " For more information visit https://soos.io/status/"
 
     # Register and load script arguments
     parser = soos.script.register_arguments()
     args = parser.parse_args()
 
+    if (args.help_formatted):
+        print_help_formatted(parser)
+        sys.exit(0)
+
     soos.script.load_script_arguments(script_args=args)
     load_context_result = soos.context.load(script_args=args)
-    MANIFEST_TEMPLATE = "{soos_base_uri}clients/{soos_client_id}/manifests"
 
     if load_context_result is False:
 
@@ -1529,11 +1630,11 @@ if __name__ == "__main__":
     if soos.script.mode in (SOOSModeOfOperation.RUN_AND_WAIT, SOOSModeOfOperation.ASYNC_INIT):
 
         # Make API call and store response, assuming that status code < 299, ie successful call.
-        create_scan_api_response = SOOSScanAPI.create_scan_metadata(context=soos.context, tool_name=None)
+        create_scan_api_response = SOOSScanAPI.create_scan_metadata(context=soos.context)
         # structure_response = SOOSStructureAPI.exec(soos.context)
 
         if create_scan_api_response is None:
-            SOOS.console_log("A Create Scan API error occurred: Could not execute API." + more_info)
+            SOOS.console_log("A Create Scan Metadata API error occurred: Could not execute API." + more_info)
             if soos.script.on_failure == SOOSOnFailure.FAIL_THE_BUILD:
                 sys.exit(1)
             else:
@@ -1541,14 +1642,14 @@ if __name__ == "__main__":
         # a response is returned but with original_response status code
         elif type(create_scan_api_response) is ErrorAPIResponse:
             SOOS.console_log(
-                f"STRUCTURE API STATUS: {create_scan_api_response.code} =====> {create_scan_api_response.message} {more_info}")
+                f"SCAN METADATA API STATUS: {create_scan_api_response.code} =====> {create_scan_api_response.message} {more_info}")
             sys.exit(1)
 
-        # ## STRUCTURE API CALL SUCCESSFUL - CONTINUE
+        # ## SCAN METADATA API CALL SUCCESSFUL - CONTINUE
 
         print()
         SOOS.console_log("------------------------")
-        SOOS.console_log("Analysis Structure Request Created")
+        SOOS.console_log("Scan Metadata Request Created")
         SOOS.console_log("------------------------")
         SOOS.console_log("Analysis Id: " + create_scan_api_response.analysisId)
         SOOS.console_log("Project Id:  " + create_scan_api_response.projectHash)
@@ -1559,7 +1660,8 @@ if __name__ == "__main__":
             project_id=create_scan_api_response.projectHash,
             analysis_id=create_scan_api_response.analysisId,
             dirs_to_exclude=soos.script.directories_to_exclude,
-            files_to_exclude=soos.script.files_to_exclude
+            files_to_exclude=soos.script.files_to_exclude,
+            package_managers=soos.script.package_managers
         )
 
         if valid_manifests_count is not None and valid_manifests_count > 0:
@@ -1580,6 +1682,9 @@ if __name__ == "__main__":
                     analysis_code = response.json()["code"]
                     analysis_message = response.json()["message"]
                     SOOS.console_log(f"ANALYSIS API STATUS: {analysis_code} =====> {analysis_message} {more_info}")
+                    # 500 code means SOOS server had an unexpected error and probably didn't update scan status
+                    if response.status_code >= 500:
+                        SOOSPatchStatusAPI.exec(soos.context, create_scan_api_response, SCAN_STATUS_ERROR, "An unexpected error occurred while starting the scan.")
                     sys.exit(1)
 
                 else:
@@ -1625,11 +1730,14 @@ if __name__ == "__main__":
                     sys.exit(0)
         else:  # valid_manifests_count is None (error) or 0
             if valid_manifests_count is None:
-                SOOS.console_log(
-                    "An error occurred uploading manifests, cannot continue. For more help, please visit https://soos.io/support")
+                scan_status = SCAN_STATUS_ERROR
+                scan_message = "An error occurred uploading manifests, cannot continue. For more help, please visit https://soos.io/support"
+                SOOS.console_log(scan_message)
             else:
-                SOOS.console_log(
-                    "No valid manifests found, cannot continue. For more help, please visit https://soos.io/support")
+                scan_status = SCAN_STATUS_INCOMPLETE
+                scan_message = "No valid manifests found, cannot continue. For more help, please visit https://soos.io/support"
+                SOOS.console_log(scan_message)
+            SOOSPatchStatusAPI.exec(soos.context, create_scan_api_response, scan_status, scan_message)
             if soos.script.on_failure == SOOSOnFailure.FAIL_THE_BUILD:
                 sys.exit(1)
             else:
@@ -1668,4 +1776,32 @@ if __name__ == "__main__":
         else:
             sys.exit(0)
 
-######
+
+def print_help_formatted(parser):
+    print("| Argument | Default | Description |")
+    print("| --- | --- | --- |")
+
+    allRows = []
+    for arg, options in parser._option_string_actions.items():
+        defaultValue = options.default
+        descriptionText = options.help.replace('\n', '<br>')
+        allRows.append(f"| {', '.join(options.option_strings)} | {defaultValue} | {descriptionText} |")
+
+    # remove duplicates
+    for row in list(OrderedDict.fromkeys(allRows)):
+        print(row)
+
+if __name__ == "__main__":
+    PyPI_URL = "https://pypi.org/project/soos-sca"
+    SOOS.console_log(f"\n\nThis CLI has been packaged and uploaded to PyPI! You can find it here: {PyPI_URL} \n")
+    SOOS.console_log("Checking latest version...")
+    latest_version, github_url = GithubVersionChecker.get_latest_version()
+    current_version = f"v{SCRIPT_VERSION}"
+
+    if latest_version is not None and latest_version != current_version:
+        SOOS.console_log(
+            f"Your current version {current_version} is out of date! Please update to the latest version {latest_version} on GitHub ({github_url}) or use the package on PyPI ({PyPI_URL}).")
+    else:
+        SOOS.console_log(f"Your current version {current_version} is the latest version available.")
+
+    entry_point()
